@@ -20,12 +20,14 @@ import (
 )
 
 type configStore struct {
-	urls      []string
-	listen    string
-	certFile  string
-	certKey   string
-	clientCAs *x509.CertPool
-	crl       *pkix.CertificateList
+	urls   []*url.URL
+	listen string
+
+	disableTLS bool
+	certFile   string
+	certKey    string
+	clientCAs  *x509.CertPool
+	crl        *pkix.CertificateList
 }
 
 var (
@@ -34,56 +36,80 @@ var (
 )
 
 func init() {
-	urls := getEnv("URLS", "http://localhost:9100")
+	urlsString := getEnv("URLS", "http://localhost:9100/metrics")
+	urls := []*url.URL{}
+	for _, urlString := range strings.Split(urlsString, ",") {
+		u, err := url.Parse(urlString)
+		if err != nil {
+			log.Fatal(err)
+		}
+		urls = append(urls, u)
+	}
+
 	listen := getEnv("LISTEN", "0.0.0.0:9443")
+	_, disableTLS := os.LookupEnv("DISABLE_TLS")
 
-	caFile := getEnv("CA", "")
-	caData, err := ioutil.ReadFile(caFile)
-	if err != nil {
-		log.Fatal("Unable to load ca from $CA.")
-	}
+	certFile := ""
+	keyFile := ""
 	clientCAs := x509.NewCertPool()
-	if ok := clientCAs.AppendCertsFromPEM(caData); !ok {
-		log.Fatal("Unable to parse $CA as ca.")
+	crl := &pkix.CertificateList{}
 
-	}
+	if !disableTLS {
+		caFile := getEnv("CA", "")
+		caData, err := ioutil.ReadFile(caFile)
+		if err != nil {
+			log.Fatal("Unable to load ca from $CA.")
+		}
+		if ok := clientCAs.AppendCertsFromPEM(caData); !ok {
+			log.Fatal("Unable to parse $CA as ca.")
 
-	crlFile := getEnv("CRL", "")
-	crlData, err := ioutil.ReadFile(crlFile)
-	if err != nil {
-		log.Fatal("Unable to load crl from $CRL.")
-	}
-	crl, err := x509.ParseCRL(crlData)
-	if err != nil {
-		log.Fatal("Unable to parse $CRL as crl.")
-	}
+		}
 
-	certFile := getEnv("CERT", "")
-	keyFile := getEnv("KEY", "")
+		crlFile := getEnv("CRL", "")
+		crlData, err := ioutil.ReadFile(crlFile)
+		if err != nil {
+			log.Fatal("Unable to load crl from $CRL.")
+		}
+		crl, err = x509.ParseCRL(crlData)
+		if err != nil {
+			log.Fatal("Unable to parse $CRL as crl.")
+		}
+
+		certFile = getEnv("CERT", "")
+		keyFile = getEnv("KEY", "")
+	}
 
 	config = configStore{
-		strings.Split(urls, ","),
+		urls,
 		listen,
+		disableTLS,
 		certFile,
 		keyFile,
 		clientCAs,
 		crl,
 	}
 
-	re = regexp.MustCompile("^(?P<name>[^#][^ {]+)({(?P<labels>.*)})? (?P<value>.*)")
+	re = regexp.MustCompile("^(?P<name>[^#][^ {]+)(?:{(?P<labels>.*)})? (?P<value>[0-9]+(?:\\.[0-9]+)?)")
 }
 
 func main() {
-	tlsConfig := &tls.Config{
-		ClientAuth: tls.RequireAndVerifyClientCert,
-		ClientCAs:  config.clientCAs,
+	if config.disableTLS {
+		log.Printf("Running WITHOUT TLS!")
+		http.HandleFunc("/metrics", metrics)
+		s := &http.Server{Addr: config.listen}
+		log.Fatal(s.ListenAndServe())
+	} else {
+		tlsConfig := &tls.Config{
+			ClientAuth: tls.RequireAndVerifyClientCert,
+			ClientCAs:  config.clientCAs,
+		}
+		s := &http.Server{
+			Addr:      config.listen,
+			TLSConfig: tlsConfig,
+		}
+		http.HandleFunc("/metrics", withTlsClientCheck(metrics))
+		log.Fatal(s.ListenAndServeTLS(config.certFile, config.certKey))
 	}
-	s := &http.Server{
-		Addr:      config.listen,
-		TLSConfig: tlsConfig,
-	}
-	http.HandleFunc("/metrics", withTlsClientCheck(metrics))
-	log.Fatal(s.ListenAndServeTLS(config.certFile, config.certKey))
 }
 
 func getEnv(key string, fallback string) string {
@@ -117,9 +143,9 @@ func metrics(w http.ResponseWriter, r *http.Request) {
 
 	c := make(chan string)
 	var wg sync.WaitGroup
-	for _, url := range config.urls {
+	for _, urlParsed := range config.urls {
 		wg.Add(1)
-		go fetch(url, c, ctx, &wg)
+		go fetch(urlParsed, c, ctx, &wg)
 	}
 	go func() {
 		wg.Wait()
@@ -131,21 +157,16 @@ func metrics(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func extend(line string, source string) (string, error) {
-	url, err := url.Parse(source)
-	if err != nil {
-		return line, err
-	}
-	label := fmt.Sprintf("%s%s", url.Host, url.Path)
+func extend(line string, label string) (string, error) {
 
 	match := re.FindStringSubmatch(line)
-	if len(match) != 5 {
+	if len(match) != 4 {
 		return line, errors.New("Invalid Line.")
 	}
 
 	lineName := match[1]
-	lineLabels := match[3]
-	lineValue := match[4]
+	lineLabels := match[2]
+	lineValue := match[3]
 	if lineLabels == "" {
 		lineLabels = fmt.Sprintf("sub_instance=\"%s\"", label)
 	} else {
@@ -155,26 +176,37 @@ func extend(line string, source string) (string, error) {
 	return line, nil
 }
 
-func fetch(url string, c chan string, ctx context.Context, wg *sync.WaitGroup) {
+func fetch(u *url.URL, c chan string, ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	req, err := http.NewRequest("GET", url, nil)
+	urlString := u.String()
+	label := fmt.Sprintf("%s%s", u.Host, u.Path)
+
+	up := 0
+	err := error(nil)
+	defer func() {
+		c <- fmt.Sprintf("up {sub_instance=\"%s\"} %d", label, up)
+		if err != nil {
+			log.Printf("Error: %s", err)
+		}
+	}()
+
+	req, err := http.NewRequest("GET", urlString, nil)
 	if err != nil {
-		log.Printf("Request Error %s.", err)
 		return
 	}
 	req = req.WithContext(ctx)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("Context Error %s.", err)
 		return
 	}
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		line := scanner.Text()
-		line, err = extend(line, url)
+		line, err = extend(line, label)
 		c <- line
 	}
 	if err := scanner.Err(); err != nil {
-		log.Printf("Scanner Error %s.", err)
+		return
 	}
+	up = 1
 }
