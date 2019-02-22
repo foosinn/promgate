@@ -17,6 +17,6 @@ URLS=http://localhost:9100/metrics,http://localhost:9101 \
 go run promgate.go
 ```
 
-**Note**: you have to supply all of these options.
+**Note**: You can disable TLS by setting `DISABLE_TLS` to anything (even empty).
 
 `URLS` is a single URL or a list of comma sperated urls. The scheme (i.e. http://) is required.
